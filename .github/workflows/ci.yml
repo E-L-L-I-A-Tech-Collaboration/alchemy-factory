@@ -1,0 +1,90 @@
+name: alchemy-factory-ci
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Solana CLI
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - name: Install Anchor (avm)
+        run: |
+          cargo install --git https://github.com/coral-xyz/anchor avm --locked
+          avm install 0.31.1
+          avm use 0.31.1
+      - name: Install JS deps
+        working-directory: programs
+        run: npm ci
+      - name: Pin deps for SBF toolchain
+        # cargo-build-sbf uses the Solana platform-tools cargo (1.79), which
+        # cannot parse edition2024 manifests. crates.io keeps releasing such
+        # crates, and with no committed Cargo.lock a fresh resolve picks them
+        # up and the build dies during resolution. So: resolve with the modern
+        # host cargo, then pin the known offenders DOWN to pre-edition2024
+        # versions before anchor build. If a future resolve pulls a NEW
+        # edition2024 crate, the build error names it; add another pin here.
+        # NOTE (2026-09-27): the indexmap pin was dropped — it was preemptive
+        # and no build error has ever named indexmap as an edition2024 crate;
+        # pinning it to 2.7.1 broke the resolve because toml_edit 0.25.x
+        # (via proc-macro-crate 3.5 -> borsh-derive -> borsh -> solana-program)
+        # requires indexmap ^2.13.0 (cargo exit 101). Only pin crates the
+        # build actually names from now on.
+        # Pin mechanics that bit us (2026-09-27, run 36319202138):
+        # - `cargo update -p <name>` is AMBIGUOUS when several major versions
+        #   are locked (proc-macro-crate had 0.1.5 AND 3.5.0) — always pin
+        #   with an explicit name@locked-version spec, discovered from
+        #   cargo metadata so future resolves don't hardcode a stale version.
+        # - Pin PARENTS before CHILDREN: zeroize_derive 1.4.2 cannot be
+        #   selected while zeroize is still locked at 1.9.0 (it requires
+        #   zeroize_derive ^1.5), so zeroize -> 1.8.1 must land first.
+        # - 2026-09-27, run 36319829259: build named hashbrown 0.17.1 as
+        #   edition2024. It comes via indexmap 2.14.x (requires hashbrown
+        #   ^0.17). Fix: pin indexmap -> 2.13.1 (edition 2021, requires
+        #   hashbrown ^0.16.1) and hashbrown -> 0.16.1 (edition 2021).
+        #   indexmap 2.13.1 still satisfies toml_edit's ^2.13.0 / ^2 reqs.
+        working-directory: programs
+        run: |
+          cargo generate-lockfile
+          pin_one() { # $1=crate name, $2=target version (downgrade pin)
+            local name="$1" target="$2" locked
+            locked=$(cargo metadata --format-version=1 2>/dev/null | python3 -c "
+          import json,sys,re
+          def key(v): return [int(x) for x in re.findall(r'\d+', v)[:4]]
+          vs=[p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='${name}']
+          print(max(vs, key=key) if vs else '')
+          ")
+            if [ -z "$locked" ]; then echo "not in dependency graph, skipping pin: $name"; return 0; fi
+            if [ "$locked" = "$target" ]; then echo "already pinned: $name $target"; return 0; fi
+            echo "pinning $name $locked -> $target"
+            cargo update -p "$name@$locked" --precise "$target"
+          }
+          pin_one proc-macro-crate 3.2.0
+          pin_one blake3 1.5.5
+          pin_one indexmap 2.13.1
+          pin_one hashbrown 0.16.1
+          pin_one unicode-segmentation 1.12.0
+          pin_one zeroize 1.8.1
+          pin_one zeroize_derive 1.4.2
+      - name: Build programs
+        working-directory: programs
+        run: anchor build
+      - name: Anchor tests (local validator)
+        working-directory: programs
+        run: |
+          # Throwaway local signer for the local validator's upgrade authority;
+          # CI must never hold a devnet/mainnet key.
+          mkdir -p ~/.config/solana
+          solana-keygen new --no-bip39-passphrase --force -o ~/.config/solana/id.json
+          anchor test --provider.cluster localnet
