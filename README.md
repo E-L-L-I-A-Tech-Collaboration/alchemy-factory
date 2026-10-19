@@ -63,4 +63,4 @@ frontend talks to RPC through the app's own read proxy, never with a key in the 
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+All rights reserved. No license is granted to copy, modify, distribute, or use this software.
